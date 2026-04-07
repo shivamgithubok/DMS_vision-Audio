@@ -1,0 +1,9 @@
+flask>=3.0.0
+numpy>=1.24.0
+opencv-python>=4.9.0
+onnxruntime>=1.17.0
+sounddevice>=0.4.6
+webrtcvad>=2.0.10
+faster-whisper>=1.0.0
+transformers>=4.36.0
+resemblyzer>=0.1.3
