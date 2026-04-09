@@ -1,9 +1,27 @@
 flask>=3.0.0
-numpy>=1.24.0
-opencv-python>=4.9.0
+opencv-python==4.13.0.92
+pillow==12.2.0
 onnxruntime>=1.17.0
-sounddevice>=0.4.6
 webrtcvad>=2.0.10
-faster-whisper>=1.0.0
-transformers>=4.36.0
-resemblyzer>=0.1.3
+faster-whisper==1.2.1
+# resemblyzer>=0.1.3
+nemo_toolkit[asr]
+numpy==2.2.6
+scipy==1.15.3
+transformers==4.57.6
+huggingface_hub==0.36.2
+accelerate==1.13.0
+soundfile==0.13.1
+sounddevice==0.5.5
+librosa==0.11.0
+scikit-learn==1.4.2
+insightface==0.7.3
+
+
+
+# Enroll
+# python test_face.py --mode enroll --name shivam --cpu
+# # then type 's' + Enter when face is in frame
+
+# # Verify
+# python test_face.py --mode verify --name shivam --cpu --duration 60
