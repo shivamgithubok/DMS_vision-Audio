@@ -6,7 +6,6 @@ import numpy as np
 from collections import deque
 from flask import Flask, Response, render_template, jsonify, request
 
-# ── ONNX ──────────────────────────────────────────────────────────────────────
 try:
     import onnxruntime as ort
     ONNX_AVAILABLE = True
@@ -14,7 +13,6 @@ except ImportError:
     ONNX_AVAILABLE = False
     print("[WARN] onnxruntime not installed. Vision in DEMO mode.")
 
-# ── DMS Audio Pipeline ────────────────────────────────────────────────────────
 try:
     from dms_pipeline import (
         DMSPipeline, VehicleContext, AlertLevel, PipelineResult,
@@ -23,6 +21,18 @@ try:
 except ImportError as e:
     AUDIO_AVAILABLE = False
     print(f"[WARN] dms_pipeline not found ({e}). Audio disabled.")
+
+try:
+    from face_verification import (
+        load_recognition_model as load_face_model,
+        get_largest_face, passive_liveness_check,
+        save_embedding, load_embedding, compare_embeddings,
+        save_preview, DB_DIR, PREVIEW_DIR,
+    )
+    FACE_AVAILABLE = True
+except ImportError as e:
+    FACE_AVAILABLE = False
+    print(f"[WARN] face_verification not found ({e}). Face ID disabled.")
 
 app = Flask(__name__)
 
@@ -137,6 +147,28 @@ enrol_state = {
     "message":  "",
     "driver_name": None,
 }
+
+# ── Face verification state ──────────────────────────────────────────────────
+face_lock       = threading.Lock()
+face_app_model  = None          # InsightFace model (lazy loaded)
+latest_raw_frame = None         # Raw BGR frame from camera thread
+
+face_enrol_state = {
+    "phase":       "idle",     # idle | capturing | processing | done | error
+    "progress":    0,
+    "message":     "",
+    "driver_name": None,
+}
+
+face_verify_state = {
+    "active":          False,
+    "match":           False,
+    "similarity":      0.0,
+    "liveness_label":  "—",
+    "liveness_score":  0.0,
+    "driver_name":     None,
+}
+face_verify_running = False     # Controls verify background loop
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ONNX SESSION
@@ -419,6 +451,11 @@ def camera_thread():
             latest_predictions = preds
             latest_fps         = round(fps, 1)
 
+        # Share raw frame for face verification
+        with face_lock:
+            global latest_raw_frame
+            latest_raw_frame = frame.copy() if camera_ok else None
+
         elapsed = time.time() - t0
         time.sleep(max(0, (1 / STREAM_FPS) - elapsed))
 
@@ -603,6 +640,253 @@ def voice_results():
     """Full voice pipeline analysis including speaker ID."""
     with audio_lock:
         return jsonify(dict(latest_audio_result))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FACE ENROLLMENT & VERIFICATION ROUTES
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_face_model():
+    """Lazy-load InsightFace model (CPU)."""
+    global face_app_model
+    if face_app_model is None:
+        if not FACE_AVAILABLE:
+            raise RuntimeError("face_verification module not available")
+        face_app_model = load_face_model(cpu=True)
+    return face_app_model
+
+
+@app.route("/face_enrol", methods=["POST"])
+def face_enrol():
+    """
+    POST /face_enrol  {"driver_name": "shivam"}
+    Captures the current camera frame, detects face, runs liveness,
+    and saves the face embedding.
+    """
+    if not FACE_AVAILABLE:
+        return jsonify({"ok": False, "msg": "Face verification module not available"}), 503
+
+    data = request.get_json(silent=True) or {}
+    driver_name = data.get("driver_name", "Driver").strip() or "Driver"
+
+    def _do_face_enrol():
+        with face_lock:
+            face_enrol_state.update(
+                phase="capturing", progress=10,
+                message="Initializing face model…",
+                driver_name=driver_name,
+            )
+        try:
+            fmodel = _get_face_model()
+
+            with face_lock:
+                face_enrol_state.update(progress=30, message="Looking for face…")
+
+            # Grab several frames and pick best face
+            best_face = None
+            best_frame = None
+            best_score = 0.0
+            for attempt in range(15):
+                time.sleep(0.3)
+                with face_lock:
+                    raw = latest_raw_frame
+                    face_enrol_state["progress"] = min(30 + attempt * 4, 85)
+                if raw is None:
+                    continue
+                face = get_largest_face(fmodel, raw)
+                if face is not None and face.det_score > best_score:
+                    best_face = face
+                    best_frame = raw.copy()
+                    best_score = face.det_score
+                    with face_lock:
+                        face_enrol_state["message"] = f"Face detected (score={face.det_score:.2f})"
+
+            if best_face is None:
+                with face_lock:
+                    face_enrol_state.update(
+                        phase="error", progress=0,
+                        message="No face detected in camera. Please face the camera.",
+                    )
+                return
+
+            # Liveness check
+            with face_lock:
+                face_enrol_state.update(progress=88, message="Checking liveness…")
+            liv_label, liv_score, is_real = passive_liveness_check(
+                best_frame, best_face.bbox
+            )
+
+            if not is_real:
+                with face_lock:
+                    face_enrol_state.update(
+                        phase="error", progress=0,
+                        message=f"Liveness FAILED ({liv_label}). Use a real face.",
+                    )
+                return
+
+            # Save embedding
+            with face_lock:
+                face_enrol_state.update(progress=95, message="Saving face embedding…")
+
+            save_embedding(driver_name, best_face.embedding)
+
+            import cv2 as _cv2
+            from face_verification import draw_face_box
+            preview = best_frame.copy()
+            draw_face_box(preview, best_face, f"Enrolled: {driver_name}", (0, 255, 0))
+            save_preview(preview, f"enrolled_{driver_name}.jpg")
+
+            with face_lock:
+                face_enrol_state.update(
+                    phase="done", progress=100,
+                    message="Face enrollment complete ✓",
+                )
+
+        except Exception as e:
+            with face_lock:
+                face_enrol_state.update(
+                    phase="error", progress=0,
+                    message=f"Enrollment failed: {e}",
+                )
+
+    threading.Thread(target=_do_face_enrol, daemon=True).start()
+    return jsonify({"ok": True, "msg": f"Face enrollment started for '{driver_name}'"})
+
+
+@app.route("/face_enrol_status")
+def face_enrol_status():
+    with face_lock:
+        return jsonify(dict(face_enrol_state))
+
+
+@app.route("/face_verify_start", methods=["POST"])
+def face_verify_start():
+    """
+    POST /face_verify_start  {"driver_name": "shivam"}
+    Starts continuous face verification in background.
+    """
+    global face_verify_running
+
+    if not FACE_AVAILABLE:
+        return jsonify({"ok": False, "msg": "Face verification module not available"}), 503
+
+    data = request.get_json(silent=True) or {}
+    driver_name = data.get("driver_name", "Driver").strip() or "Driver"
+
+    # Check if face is enrolled
+    import os
+    emb_path = os.path.join(DB_DIR, f"{driver_name}.npy")
+    if not os.path.exists(emb_path):
+        return jsonify({"ok": False, "msg": f"No face enrolled for '{driver_name}'"}), 404
+
+    if face_verify_running:
+        return jsonify({"ok": True, "msg": "Verification already running"})
+
+    face_verify_running = True
+
+    def _verify_loop():
+        global face_verify_running
+        try:
+            fmodel = _get_face_model()
+            enrolled_emb = load_embedding(driver_name)
+
+            while face_verify_running:
+                with face_lock:
+                    raw = latest_raw_frame
+                if raw is None:
+                    time.sleep(0.3)
+                    continue
+
+                face = get_largest_face(fmodel, raw)
+                if face is None:
+                    with face_lock:
+                        face_verify_state.update(
+                            active=True, match=False,
+                            similarity=0.0,
+                            liveness_label="No Face",
+                            liveness_score=0.0,
+                            driver_name=driver_name,
+                        )
+                    time.sleep(0.3)
+                    continue
+
+                liv_label, liv_score, is_real = passive_liveness_check(
+                    raw, face.bbox
+                )
+
+                if not is_real:
+                    with face_lock:
+                        face_verify_state.update(
+                            active=True, match=False,
+                            similarity=0.0,
+                            liveness_label=liv_label,
+                            liveness_score=round(liv_score, 3),
+                            driver_name=driver_name,
+                        )
+                else:
+                    sim, is_match = compare_embeddings(
+                        face.embedding, enrolled_emb, 0.45
+                    )
+                    with face_lock:
+                        face_verify_state.update(
+                            active=True, match=is_match,
+                            similarity=round(sim, 3),
+                            liveness_label=liv_label,
+                            liveness_score=round(liv_score, 3),
+                            driver_name=driver_name,
+                        )
+
+                time.sleep(0.5)  # ~2 FPS for face verify
+
+        except Exception as e:
+            print(f"[ERR] Face verify loop: {e}")
+        finally:
+            face_verify_running = False
+            with face_lock:
+                face_verify_state["active"] = False
+
+    threading.Thread(target=_verify_loop, daemon=True).start()
+    return jsonify({"ok": True, "msg": f"Face verification started for '{driver_name}'"})
+
+
+@app.route("/face_verify_status")
+def face_verify_status():
+    with face_lock:
+        state = dict(face_verify_state)
+    # Convert numpy types to native Python (numpy bool_ is not JSON serializable)
+    state["active"]    = bool(state.get("active", False))
+    state["match"]     = bool(state.get("match", False))
+    state["similarity"] = float(state.get("similarity", 0.0))
+    state["liveness_score"] = float(state.get("liveness_score", 0.0))
+    return jsonify(state)
+
+
+@app.route("/face_verify_stop", methods=["POST"])
+def face_verify_stop():
+    global face_verify_running
+    face_verify_running = False
+    with face_lock:
+        face_verify_state["active"] = False
+    return jsonify({"ok": True, "msg": "Face verification stopped"})
+
+
+@app.route("/face_status")
+def face_status_route():
+    """Check if a face is enrolled."""
+    import os
+    enrolled_faces = []
+    if FACE_AVAILABLE and os.path.exists(DB_DIR):
+        enrolled_faces = [
+            f.replace(".npy", "")
+            for f in os.listdir(DB_DIR)
+            if f.endswith(".npy")
+        ]
+    return jsonify({
+        "available":      FACE_AVAILABLE,
+        "enrolled":       len(enrolled_faces) > 0,
+        "enrolled_names": enrolled_faces,
+        "verify_active":  face_verify_running,
+    })
 
 
 # ─────────────────────────────────────────────────────────────────────────────
