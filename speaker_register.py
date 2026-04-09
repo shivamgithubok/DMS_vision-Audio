@@ -1,72 +1,110 @@
 import os
-import time
 import numpy as np
-import sounddevice as sd
+import tempfile
+import soundfile as sf
 
-from resemblyzer import VoiceEncoder, preprocess_wav
+import nemo.collections.asr as nemo_asr
 
-# ── Config ─────────────────────────────────────────────────────────
-SR              = 16000
-DEFAULT_SECONDS = 5.0
-EMBED_PATH      = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                               "driver_embedding.npy")
-THRESHOLD       = 0.50   
+# ── Config ─────────────────────────────────────────
+SR = 16000
+EMBED_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "driver_embedding.npy")
+
+HIGH_THRESHOLD = 0.50   # confident match
+LOW_THRESHOLD  = 0.40   # uncertain zone
+
 
 class SpeakerVerifier:
-    """Thin wrapper around resemblyzer for the DMS pipeline."""
+    """TitaNet-based speaker verification"""
 
-    def __init__(self, embed_path: str = EMBED_PATH, threshold: float = THRESHOLD):
+    def __init__(self, embed_path: str = EMBED_PATH):
         self.embed_path = embed_path
-        self.threshold  = threshold
 
-        print("[SPEAKER] Loading resemblyzer encoder…")
-        self.encoder = VoiceEncoder(device="cpu")
-        print("[SPEAKER] Encoder ready ✓")
+        print("[SPEAKER] Loading TitaNet model...")
+        self.model = nemo_asr.models.EncDecSpeakerLabelModel.from_pretrained(
+            model_name="titanet_large"
+        )
+        print("[SPEAKER] TitaNet ready ✓")
 
-        # Load existing driver embedding if available
         self.driver_embed = None
+
         if os.path.isfile(self.embed_path):
             self.driver_embed = np.load(self.embed_path)
             print(f"[SPEAKER] Driver embedding loaded from {self.embed_path}")
         else:
-            print("[SPEAKER] No driver embedding found — enrol first")
+            print("[SPEAKER] No driver embedding found — enroll first")
 
+    # ───────────────────────────────────────────────
+    def _audio_to_embedding(self, audio: np.ndarray):
+        """
+        Convert numpy audio → temp wav → TitaNet embedding
+        """
+        audio = np.asarray(audio, dtype=np.float32).flatten()
 
+        # normalize to safe range
+        if np.max(np.abs(audio)) > 1.0:
+            audio = audio / (np.max(np.abs(audio)) + 1e-9)
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            temp_path = f.name
+            sf.write(temp_path, audio, SR)
+
+        emb = self.model.get_embedding(temp_path)
+
+        os.remove(temp_path)
+
+        # handle torch tensor / numpy safely
+        if hasattr(emb, "detach"):
+            emb = emb.detach().cpu().numpy()
+
+        return emb.flatten()
+
+    # ───────────────────────────────────────────────
     def enrol(self, audio: np.ndarray):
         """
-        Compute and save driver voiceprint from raw float32 audio (16 kHz).
+        Enroll driver voice
         """
-        wav = preprocess_wav(audio, source_sr=SR)
-        embed = self.encoder.embed_utterance(wav)
+        embed = self._audio_to_embedding(audio)
+
         np.save(self.embed_path, embed)
         self.driver_embed = embed
-        print(f"[SPEAKER] Driver embedding saved → {self.embed_path}")
 
-    def identify(self, audio: np.ndarray) -> tuple:
+        print(f"[SPEAKER] Driver enrolled → {self.embed_path}")
+
+    # ───────────────────────────────────────────────
+    def identify(self, audio: np.ndarray):
+        """
+        Identify speaker
+        """
         if self.driver_embed is None:
             return ("UNKNOWN", 0.0)
 
-        wav   = preprocess_wav(audio, source_sr=SR)
-        embed = self.encoder.embed_utterance(wav)
+        embed = self._audio_to_embedding(audio)
 
-        score = float(np.dot(self.driver_embed, embed) /
-                    (np.linalg.norm(self.driver_embed) *
-                        np.linalg.norm(embed) + 1e-9))
+        # cosine similarity
+        score = float(
+            np.dot(self.driver_embed, embed) /
+            (np.linalg.norm(self.driver_embed) *
+             np.linalg.norm(embed) + 1e-9)
+        )
 
-        if score >= self.threshold:
+        # decision logic
+        if score >= HIGH_THRESHOLD:
             label = "DRIVER"
-        elif score >= 0.35:
-            label = "PASSENGER"
+        elif score >= LOW_THRESHOLD:
+            label = "UNCERTAIN"
         else:
-            label = "UNKNOWN"
+            label = "NOT_DRIVER"
 
-        print(f"[SPEAKER DEBUG] raw_score={score:.4f}  threshold={self.threshold}  label={label}")
+        print(f"[SPEAKER DEBUG] score={score:.4f} → {label}")
+
         return (label, round(score, 3))
-        
-    
-    def status(self) -> dict:
+
+    # ───────────────────────────────────────────────
+    def status(self):
         return {
-            "enrolled":    self.driver_embed is not None,
-            "embed_path":  self.embed_path,
-            "threshold":   self.threshold,
+            "enrolled": self.driver_embed is not None,
+            "embed_path": self.embed_path,
+            "high_threshold": HIGH_THRESHOLD,
+            "low_threshold": LOW_THRESHOLD,
         }
