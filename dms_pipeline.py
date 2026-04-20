@@ -17,25 +17,7 @@
 # Final Risk Score  (speaker-aware)
 #  ↓
 # Alert
-# ============================================================
-# DMS PIPELINE  —  fixed version
-#
-# Key fixes vs previous version:
-#   1. Speaker ID runs ONCE at segment-end on full audio (not mid-stream)
-#      → eliminates CPU spike, fixes latency, gives TitaNet enough audio
-#   2. Removed `continue` inside `elif state == "continue"` block
-#      → that was silently dropping mic chunks and starving the queue
-#   3. BERT risk capped at 0.55 so sentiment alone can never fire CRITICAL
-#      → only keyword hits can reach WARNING/CRITICAL on their own
-#   4. UNKNOWN speaker weight raised to 0.85 (was 0.6) so real alerts
-#      still fire even before enrolment
-#   5. Graceful shutdown — no sys.exit() in signal handler; let the loop
-#      exit cleanly so torch teardown doesn't core-dump
-#   6. Enrollment audio pre-filtered to speech-only frames before enrol
-#      → better voiceprint quality
-#   7. Speaker smoothing: rolling window of last N scores, majority vote
-#      → stops flip-flopping between DRIVER / UNCERTAIN
-# ============================================================
+
 
 import os
 import time
@@ -62,22 +44,19 @@ except ImportError:
     SPEAKER_AVAILABLE = False
     print("[WARN] speaker_register.py not found — speaker ID disabled")
 
-# ============================================================
-# CONFIG
-# ============================================================
 
 SR          = 16000
 CHUNK_MS    = 30
-CHUNK       = int(SR * CHUNK_MS / 1000)   # 480 samples
+CHUNK       = int(SR * CHUNK_MS / 1000)  
 CHANNELS    = 1
 
-# VAD
-VAD_MODE    = 2   # 0-3, higher = stricter
 
-# FSM
-START_SPEECH_FRAMES = 3      # 3 × 30ms = 90ms to start
-END_SILENCE_FRAMES  = 20     # 20 × 30ms = 600ms silence to end
-MIN_SEGMENT_SEC     = 1.5    # TitaNet needs ≥1.5s
+VAD_MODE    = 2  
+
+
+START_SPEECH_FRAMES = 3      
+END_SILENCE_FRAMES  = 20     
+MIN_SEGMENT_SEC     = 1.5    
 MAX_SEGMENT_SEC     = 7.0
 
 # Whisper
@@ -87,14 +66,10 @@ WHISPER_COMPUTE = "int8"
 
 # BERT
 BERT_MIN_TEXT_LEN = 3
-BERT_RISK_CAP     = 0.55   # ← cap: sentiment alone cannot fire CRITICAL
+BERT_RISK_CAP     = 0.55   
 
-# Speaker smoothing — rolling window size
-SPEAKER_WINDOW = 4   # last 4 segment results voted on
+SPEAKER_WINDOW = 4   
 
-# ============================================================
-# ENUMS & DATACLASSES
-# ============================================================
 
 class AlertLevel(enum.Enum):
     NONE     = "NONE"
@@ -145,9 +120,6 @@ class VehicleContext:
     gaze_deviation:  float = 0.0
 
 
-# ============================================================
-# GLOBALS  (standalone CLI mode only)
-# ============================================================
 
 audio_q       = queue.Queue()
 running       = True
@@ -160,9 +132,6 @@ def audio_callback(indata, frames, time_info, status):
     audio_q.put(indata.copy().reshape(-1))
 
 
-# ============================================================
-# HELPERS
-# ============================================================
 
 def rms(x: np.ndarray) -> float:
     return float(np.sqrt(np.mean(np.square(x))) + 1e-9)
@@ -212,13 +181,10 @@ def _filter_speech_frames(audio: np.ndarray, sr: int = SR,
         except Exception:
             pass
     if not speech_frames:
-        return audio          # fallback: return full audio if VAD finds nothing
+        return audio         
     return np.concatenate(speech_frames)
 
 
-# ============================================================
-# SPEAKER SMOOTHER
-# ============================================================
 
 class SpeakerSmoother:
     """
@@ -246,9 +212,6 @@ class SpeakerSmoother:
         self._history.clear()
 
 
-# ============================================================
-# KEYWORD SPOTTER
-# ============================================================
 
 class KeywordSpotter:
     def __init__(self):
@@ -280,9 +243,6 @@ class KeywordSpotter:
         return best_kw, best_score
 
 
-# ============================================================
-# BERT TEXT CLASSIFIER
-# ============================================================
 
 class TextRiskClassifier:
     def __init__(self):
@@ -303,7 +263,6 @@ class TextRiskClassifier:
             label = out["label"]
             score = float(out["score"])
 
-            # Map sentiment → risk, then cap so BERT alone can't fire CRITICAL
             if label == "NEGATIVE":
                 raw_risk = score
             else:
@@ -317,9 +276,6 @@ class TextRiskClassifier:
             return {"label": "ERROR", "score": 0.0, "risk": 0.0}
 
 
-# ============================================================
-# SPEECH FSM
-# ============================================================
 
 class SpeechFSM:
     def __init__(self):
@@ -346,9 +302,6 @@ class SpeechFSM:
         return "idle"
 
 
-# ============================================================
-# ASR
-# ============================================================
 
 class ASR:
     def __init__(self):
@@ -375,17 +328,12 @@ class ASR:
         return text, latency_ms
 
 
-# ============================================================
-# FINAL RISK  (speaker-aware)
-# ============================================================
-
 def compute_final_risk(keyword_score: float,
                        bert_risk: float,
                        speaker_id: str = "UNKNOWN") -> tuple:
 
     base = max(keyword_score, bert_risk)
 
-    # High-confidence keywords always fire at full weight
     KEYWORD_OVERRIDE = 0.90
     if keyword_score >= KEYWORD_OVERRIDE:
         weighted = base
@@ -393,9 +341,9 @@ def compute_final_risk(keyword_score: float,
         weighted = base * 1.0
     elif speaker_id == "PASSENGER":
         weighted = base * 0.7
-    else:                            # UNKNOWN / UNCERTAIN
-        weighted = base * 0.85       # was 0.6 — don't suppress real alerts
-                                     # but BERT cap means max ~0.47 without KW
+    else:                            
+        weighted = base * 0.85       
+                                    
 
     if weighted >= 0.85:
         alert = "CRITICAL"
@@ -409,9 +357,6 @@ def compute_final_risk(keyword_score: float,
     return weighted, alert
 
 
-# ============================================================
-# ALERT OUTPUT
-# ============================================================
 
 class AlertOutput:
     """Dispatches PipelineResult to registered callbacks."""
@@ -426,9 +371,6 @@ class AlertOutput:
             )
 
 
-# ============================================================
-# DMS PIPELINE
-# ============================================================
 
 class DMSPipeline:
     """
@@ -445,7 +387,6 @@ class DMSPipeline:
         self._vehicle_ctx   = VehicleContext()
         self._alert_output  = AlertOutput()
 
-        # Sub-components (lazy-loaded in _run)
         self._vad      = None
         self._kws      = None
         self._bert     = None
@@ -454,7 +395,6 @@ class DMSPipeline:
         self._speaker  = None
         self._smoother = SpeakerSmoother(SPEAKER_WINDOW)
 
-    # ── Public API ────────────────────────────────────────────
 
     def start(self):
         if self._running:
@@ -496,7 +436,6 @@ class DMSPipeline:
             time.sleep(seconds)
 
         raw   = np.concatenate(frames)
-        # Strip silence so voiceprint is speech-only
         clean = _filter_speech_frames(raw)
         clean = normalize_audio(clean, target_rms=0.05)
 
@@ -504,7 +443,7 @@ class DMSPipeline:
             print("[ENROL] Not enough speech detected — please speak more clearly")
             return
 
-        self._smoother.reset()   # reset history after new enrolment
+        self._smoother.reset()   
         self._speaker.enrol(clean)
         print(f"[ENROL] Driver voice registered ✓  ({len(clean)/SR:.1f}s of speech used)")
 
@@ -519,7 +458,6 @@ class DMSPipeline:
         info["available"] = True
         return info
 
-    # ── Internal loop ─────────────────────────────────────────
 
     def _run(self):
         print("[DMS] Loading sub-components…")
@@ -582,37 +520,29 @@ class DMSPipeline:
 
             state = self._fsm.update(is_speech)
 
-            # ── Accumulate segment ────────────────────────────
             if state == "start":
                 current_segment = [clean.copy()]
 
             elif state == "continue":
-                # FIX: NO `continue` statement here — every chunk must be
-                # processed; skipping causes queue backup and latency
                 current_segment.append(clean.copy())
                 seg_len = len(np.concatenate(current_segment)) / SR
                 if seg_len >= MAX_SEGMENT_SEC:
-                    state = "end"   # force end on max length
+                    state = "end"   
 
-            # ── Process completed segment ─────────────────────
             if state == "end" and len(current_segment) > 0:
                 segment         = np.concatenate(current_segment)
                 current_segment = []
                 seg_len         = len(segment) / SR
 
                 if seg_len < MIN_SEGMENT_SEC:
-                    # Too short — skip silently, don't log spam
                     continue
 
                 t_start = time.time()
 
-                # ── Speaker ID (runs ONCE on full segment) ────
-                # Running on the full segment gives TitaNet the audio it
-                # needs and avoids the per-chunk CPU spike.
+                
                 if self._speaker is not None:
                     try:
                         raw_label, raw_score = self._speaker.identify(segment)
-                        # Smooth over last N segments → stable label
                         speaker_id, spk_score = self._smoother.update(raw_label, raw_score)
                         print(f"[SPEAKER] raw={raw_label}({raw_score:.3f}) "
                               f"→ smoothed={speaker_id}({spk_score:.3f})")
@@ -622,21 +552,16 @@ class DMSPipeline:
                 else:
                     speaker_id, spk_score = "UNKNOWN", 0.0
 
-                # ── ASR ───────────────────────────────────────
                 text, asr_latency = self._asr.transcribe(segment)
 
-                # ── Hallucination filter ──────────────────────
                 if text and _is_whisper_hallucination(text):
                     print(f"[DMS] Hallucination filtered: {text[:80]!r}…")
                     text = ""
 
-                # ── Keyword ───────────────────────────────────
                 kw, kw_score = self._kws.score_text(text)
 
-                # ── BERT ──────────────────────────────────────
                 bert_out = self._bert.classify(text)
 
-                # ── Risk ──────────────────────────────────────
                 final_risk, alert_str = compute_final_risk(
                     kw_score, bert_out["risk"], speaker_id
                 )
@@ -678,23 +603,15 @@ class DMSPipeline:
         print("[DMS] Audio pipeline stopped")
 
 
-# ============================================================
-# SHUTDOWN  — graceful, no sys.exit in signal handler
-# ============================================================
 
 def stop_handler(sig, frame):
     global running
     print("\n[INFO] Stopping...")
     running = False
-    # Do NOT call sys.exit here — torch atexit hooks need to run cleanly
 
 signal.signal(signal.SIGINT,  stop_handler)
 signal.signal(signal.SIGTERM, stop_handler)
 
-
-# ============================================================
-# STANDALONE CLI MAIN
-# ============================================================
 
 def main():
     global running, chunk_counter
@@ -758,7 +675,6 @@ def main():
 
                 print("\n================ DMS AUDIO DEBUG ================")
 
-                # Speaker (on full segment)
                 if speaker is not None:
                     raw_lbl, raw_sc = speaker.identify(segment)
                     spk_id, spk_sc  = smoother.update(raw_lbl, raw_sc)
@@ -766,27 +682,23 @@ def main():
                 else:
                     spk_id, spk_sc = "UNKNOWN", 0.0
 
-                # ASR
+                
                 text, latency = asr.transcribe(segment)
                 print(f"[ASR]        transcript={repr(text)}  latency={latency:.1f}ms")
 
-                # Keyword
+                
                 kw, kw_score = kws.score_text(text)
                 print(f"[KEYWORD]    kw={kw}  score={kw_score:.2f}")
 
-                # BERT
+                
                 bout = bert.classify(text)
                 print(f"[BERT]       label={bout['label']}  score={bout['score']:.2f}"
                       f"  risk={bout['risk']:.2f}")
 
-                # Risk
+              
                 risk, alert = compute_final_risk(kw_score, bout["risk"], spk_id)
                 print(f"[RISK]       score={risk:.2f}  alert={alert}")
                 print("=================================================\n")
-
-
-if __name__ == "__main__":
-    main()
 
 
 if __name__ == "__main__":
