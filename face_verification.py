@@ -28,6 +28,36 @@
 #          V                                  
 #       MATCH / NO MATCH                      
 #   
+#    Camera Frame                            
+#          |                                  
+#          V                                  
+#     Face Detection                          
+#     (InsightFace det_10g.onnx)              
+#          |                                  
+#          V                                  
+#     Landmark Alignment                      
+#     (2d106det / 1k3d68.onnx)                
+#          |                                  
+#          V                                  
+#     Passive Liveness  (texture-based)       
+#         |
+#     | Signal 1: Laplacian sharp  (45%) |    
+#     | Signal 2: LBP micro-tex    (35%) |    
+#     | Signal 3: HSV saturation   (20%) |    
+#         |
+#     REAL  --> continue                      
+#     SPOOF --> REJECT                        
+#          |                                  
+#          V  (only if REAL)                  
+#     Face Recognition                        
+#     (w600k_r50.onnx, 512-d embedding)       
+#          |                                  
+#          V                                  
+#     Cosine Similarity   threshold=0.45      
+#          |                                  
+#          V                                  
+#       MATCH / NO MATCH                      
+#   
 import os
 import cv2
 import time
@@ -37,18 +67,13 @@ from sklearn.metrics.pairwise import cosine_similarity
 from insightface.app import FaceAnalysis
 
 
-# ============================================================
-# CONFIG
-# ============================================================
+
 DB_DIR      = "face_db"
 PREVIEW_DIR = "face_preview"
 os.makedirs(DB_DIR, exist_ok=True)
 os.makedirs(PREVIEW_DIR, exist_ok=True)
 
 
-# ============================================================
-# LOAD RECOGNITION MODEL
-# ============================================================
 def load_recognition_model(cpu=False):
     app = FaceAnalysis(name="buffalo_l")
     app.prepare(ctx_id=-1 if cpu else 0, det_size=(640, 640))
@@ -105,29 +130,21 @@ def passive_liveness_check(frame, bbox, debug=False):
     gray = cv2.cvtColor(face_resized, cv2.COLOR_BGR2GRAY)
     hsv  = cv2.cvtColor(face_resized, cv2.COLOR_BGR2HSV)
 
-    # Signal 1: Laplacian sharpness
-    # Real faces: high variance (lots of detail)
-    # Photos/screens: low variance (smooth, flat)
+    
     lap_var   = cv2.Laplacian(gray, cv2.CV_64F).var()
-    lap_score = min(lap_var / 500.0, 1.0)   # real ~200-800, spoof ~20-150
-
-    # Signal 2: LBP micro-texture variance
-    # Real skin has rich micro-texture -> high LBP std
-    # Printed/screen face is smooth    -> low LBP std
+    lap_score = min(lap_var / 500.0, 1.0)   
+    
     lbp       = compute_lbp(gray)
     lbp_std   = float(np.std(lbp))
-    lbp_score = min(lbp_std / 80.0, 1.0)    # real ~55-90, spoof ~20-45
+    lbp_score = min(lbp_std / 80.0, 1.0)   
 
-    # Signal 3: HSV saturation naturalness
-    # Screens are oversaturated; prints are flat
-    # Real skin has moderate, varied saturation
+    
     sat       = hsv[:, :, 1].astype(np.float32)
     sat_mean  = float(np.mean(sat))
     sat_score = 1.0 - abs(sat_mean - 80.0) / 120.0
     sat_score = float(np.clip(sat_score, 0.0, 1.0))
 
-    # Combined score (weighted)
-    # Laplacian is strongest signal for Jetson Nano camera
+    
     score = (0.45 * lap_score) + (0.35 * lbp_score) + (0.20 * sat_score)
     score = float(np.clip(score, 0.0, 1.0))
 
@@ -143,9 +160,7 @@ def passive_liveness_check(frame, bbox, debug=False):
     return label, score, is_real
 
 
-# ============================================================
-# FACE EXTRACTION
-# ============================================================
+
 def get_largest_face(app, frame):
     faces = app.get(frame)
     if not faces:
@@ -153,9 +168,7 @@ def get_largest_face(app, frame):
     return max(faces, key=lambda f: (f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1]))
 
 
-# ============================================================
-# DRAW HELPERS
-# ============================================================
+
 def draw_face_box(frame, face, label="", color=(0, 255, 0)):
     if face is None:
         return frame
@@ -174,9 +187,7 @@ def draw_status(frame, lines, start_y=40, color=(255, 255, 0)):
     return frame
 
 
-# ============================================================
-# EMBEDDING HELPERS
-# ============================================================
+
 def save_embedding(name, embedding):
     path = os.path.join(DB_DIR, f"{name}.npy")
     np.save(path, embedding)
@@ -195,9 +206,7 @@ def compare_embeddings(emb1, emb2, threshold=0.45):
     return float(sim), sim >= threshold
 
 
-# ============================================================
-# CAMERA
-# ============================================================
+
 def open_camera(camera_id=0, width=1280, height=720):
     cap = cv2.VideoCapture(camera_id)
     if not cap.isOpened():
@@ -211,16 +220,11 @@ def save_preview(frame, name="preview.jpg"):
     cv2.imwrite(os.path.join(PREVIEW_DIR, name), frame)
 
 
-# ============================================================
-# PIPELINE DIAGRAM
-# ============================================================
+
 def print_pipeline():
     print("")
 
 
-# ============================================================
-# ENROLL MODE
-# ============================================================
 def enroll_mode(app, name, camera_id=0, debug=False):
     print("=" * 60)
     print(f"[ENROLL MODE] User: {name}")
@@ -273,9 +277,6 @@ def enroll_mode(app, name, camera_id=0, debug=False):
     cv2.destroyAllWindows()
 
 
-# ============================================================
-# VERIFY MODE
-# ============================================================
 def verify_mode(app, name, threshold=0.45, camera_id=0, debug=False):
     print("=" * 60)
     print(f"[VERIFY MODE] User: {name}  threshold={threshold}")
@@ -341,9 +342,6 @@ def verify_mode(app, name, threshold=0.45, camera_id=0, debug=False):
     cv2.destroyAllWindows()
 
 
-# ============================================================
-# MAIN
-# ============================================================
 def main():
     parser = argparse.ArgumentParser(
         description="Face Pipeline: Texture Liveness + InsightFace Recognition")
