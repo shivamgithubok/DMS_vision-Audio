@@ -5,13 +5,12 @@ import soundfile as sf
 
 import nemo.collections.asr as nemo_asr
 
-# ── Config ─────────────────────────────────────────
 SR = 16000
 EMBED_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "driver_embedding.npy")
 
-HIGH_THRESHOLD = 0.50   # confident match
-LOW_THRESHOLD  = 0.40   # uncertain zone
+HIGH_THRESHOLD = 0.45   
+LOW_THRESHOLD  = 0.30   
 
 
 class SpeakerVerifier:
@@ -34,14 +33,13 @@ class SpeakerVerifier:
         else:
             print("[SPEAKER] No driver embedding found — enroll first")
 
-    # ───────────────────────────────────────────────
     def _audio_to_embedding(self, audio: np.ndarray):
         """
         Convert numpy audio → temp wav → TitaNet embedding
         """
         audio = np.asarray(audio, dtype=np.float32).flatten()
 
-        # normalize to safe range
+        
         if np.max(np.abs(audio)) > 1.0:
             audio = audio / (np.max(np.abs(audio)) + 1e-9)
 
@@ -53,13 +51,12 @@ class SpeakerVerifier:
 
         os.remove(temp_path)
 
-        # handle torch tensor / numpy safely
+        
         if hasattr(emb, "detach"):
             emb = emb.detach().cpu().numpy()
 
         return emb.flatten()
 
-    # ───────────────────────────────────────────────
     def enrol(self, audio: np.ndarray):
         """
         Enroll driver voice
@@ -71,7 +68,6 @@ class SpeakerVerifier:
 
         print(f"[SPEAKER] Driver enrolled → {self.embed_path}")
 
-    # ───────────────────────────────────────────────
     def identify(self, audio: np.ndarray):
         """
         Identify speaker
@@ -81,14 +77,14 @@ class SpeakerVerifier:
 
         embed = self._audio_to_embedding(audio)
 
-        # cosine similarity
+        
         score = float(
             np.dot(self.driver_embed, embed) /
             (np.linalg.norm(self.driver_embed) *
              np.linalg.norm(embed) + 1e-9)
         )
 
-        # decision logic
+        
         if score >= HIGH_THRESHOLD:
             label = "DRIVER"
         elif score >= LOW_THRESHOLD:
@@ -100,11 +96,12 @@ class SpeakerVerifier:
 
         return (label, round(score, 3))
 
-    # ───────────────────────────────────────────────
     def status(self):
         return {
             "enrolled": self.driver_embed is not None,
             "embed_path": self.embed_path,
             "high_threshold": HIGH_THRESHOLD,
             "low_threshold": LOW_THRESHOLD,
+            "driver_name": os.path.splitext(os.path.basename(self.embed_path))[0]
+                        if self.driver_embed is not None else None,
         }
