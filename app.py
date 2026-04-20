@@ -36,9 +36,6 @@ except ImportError as e:
 
 app = Flask(__name__)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
 MODEL_PATH   = "edge_driver_model.onnx"
 IMG_SIZE     = 224
 CAMERA_INDEX = 0
@@ -48,9 +45,6 @@ JPEG_QUALITY = 80
 MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LABEL MAPS
-# ─────────────────────────────────────────────────────────────────────────────
 TASK_META = {
     "drowsiness": {
         "label": "Drowsiness", "icon": "😴",
@@ -109,16 +103,12 @@ TASK_META = {
 
 TASK_ORDER = ["drowsiness", "eye_state", "yawn", "gaze", "emotion", "activity"]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SHARED STATE
-# ─────────────────────────────────────────────────────────────────────────────
 state_lock         = threading.Lock()
 latest_frame_jpg   = None
 latest_predictions = {}
 latest_fps         = 0.0
 camera_ok          = False
 
-# Audio state — updated by audio pipeline callback
 audio_lock          = threading.Lock()
 latest_audio_result = {
     "active":         False,
@@ -130,8 +120,8 @@ latest_audio_result = {
     "keyword_score":  0.0,
     "text_risk":      0.0,
     "transcript":     None,
-    "speaker":        None,          # "DRIVER" | "PASSENGER" | "UNKNOWN"
-    "speaker_score":  0.0,           # cosine similarity
+    "speaker":        None,         
+    "speaker_score":  0.0,          
     "latency_ms":     0.0,
     "bert_label":     "NEUTRAL",
     "bert_score":     0.0,
@@ -140,21 +130,19 @@ audio_event_queue = deque(maxlen=50)
 audio_pipeline    = None
 audio_ok          = False
 
-# Enrollment progress state
 enrol_state = {
-    "phase":    "idle",    # idle | recording | processing | done | error
-    "progress": 0,         # 0-100
+    "phase":    "idle",    
+    "progress": 0,         
     "message":  "",
     "driver_name": None,
 }
 
-# ── Face verification state ──────────────────────────────────────────────────
 face_lock       = threading.Lock()
-face_app_model  = None          # InsightFace model (lazy loaded)
-latest_raw_frame = None         # Raw BGR frame from camera thread
+face_app_model  = None         
+latest_raw_frame = None        
 
 face_enrol_state = {
-    "phase":       "idle",     # idle | capturing | processing | done | error
+    "phase":       "idle",     
     "progress":    0,
     "message":     "",
     "driver_name": None,
@@ -168,11 +156,8 @@ face_verify_state = {
     "liveness_score":  0.0,
     "driver_name":     None,
 }
-face_verify_running = False     # Controls verify background loop
+face_verify_running = False    
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ONNX SESSION
-# ─────────────────────────────────────────────────────────────────────────────
 session = None
 
 def load_model():
@@ -194,9 +179,6 @@ def load_model():
         print(f"[WARN] Vision model not loaded ({e}). Demo mode.")
         session = None
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PREPROCESSING + SOFTMAX
-# ─────────────────────────────────────────────────────────────────────────────
 def preprocess(frame_bgr: np.ndarray) -> np.ndarray:
     rgb  = cv2.cvtColor(cv2.resize(frame_bgr, (IMG_SIZE, IMG_SIZE)), cv2.COLOR_BGR2RGB)
     norm = (rgb.astype(np.float32) / 255.0 - MEAN) / STD
@@ -206,9 +188,6 @@ def softmax(x: np.ndarray) -> np.ndarray:
     e = np.exp(x - x.max())
     return e / e.sum()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DEMO PREDICTIONS
-# ─────────────────────────────────────────────────────────────────────────────
 _demo_t = 0.0
 
 def demo_predictions() -> dict:
@@ -229,9 +208,7 @@ def demo_predictions() -> dict:
         }
     return results
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TEMPORAL SMOOTHING
-# ─────────────────────────────────────────────────────────────────────────────
+
 _buffers: dict = {task: deque(maxlen=10) for task in TASK_META}
 
 def smooth_predictions(raw: dict) -> dict:
@@ -250,9 +227,6 @@ def smooth_predictions(raw: dict) -> dict:
         }
     return smoothed
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AUDIO PIPELINE — init & callback
-# ─────────────────────────────────────────────────────────────────────────────
 def _on_audio_result(result: "PipelineResult"):
     """Called by DMSPipeline on every pipeline result."""
     with audio_lock:
@@ -266,14 +240,13 @@ def _on_audio_result(result: "PipelineResult"):
             "keyword_score": round(getattr(result, "keyword_score", 0.0), 3),
             "text_risk":     round(result.text_risk, 3),
             "transcript":    result.transcript,
-            "speaker":       result.speaker_id,          # DRIVER/PASSENGER/UNKNOWN
+            "speaker":       result.speaker_id,         
             "speaker_score": round(getattr(result, "speaker_score", 0.0), 3),
             "latency_ms":    round(result.latency_ms, 1),
             "bert_label":    getattr(result, "bert_label", "NEUTRAL"),
             "bert_score":    round(getattr(result, "bert_score", 0.0), 3),
         })
 
-        # Push non-NONE events to SSE alert log
         if result.alert_level != AlertLevel.NONE:
             audio_event_queue.append({
                 "ts":      time.strftime("%H:%M:%S"),
@@ -282,7 +255,7 @@ def _on_audio_result(result: "PipelineResult"):
                 "label":   result.yamnet_label,
                 "kw":      result.keyword_hit,
                 "text":    result.transcript,
-                "speaker": result.speaker_id,   # ← now included in event log
+                "speaker": result.speaker_id,   
             })
 
 
@@ -322,9 +295,6 @@ def start_audio_pipeline():
         audio_ok = False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FRAME OVERLAY
-# ─────────────────────────────────────────────────────────────────────────────
 def _draw_overlay(frame: np.ndarray, preds: dict) -> np.ndarray:
     h, w = frame.shape[:2]
 
@@ -365,9 +335,6 @@ def _draw_overlay(frame: np.ndarray, preds: dict) -> np.ndarray:
     return frame
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CAMERA + VISION THREAD
-# ─────────────────────────────────────────────────────────────────────────────
 def _blank_frame() -> np.ndarray:
     f = np.zeros((480, 640, 3), dtype=np.uint8)
     cv2.putText(f, "NO CAMERA", (220, 240),
@@ -460,9 +427,6 @@ def camera_thread():
         time.sleep(max(0, (1 / STREAM_FPS) - elapsed))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FLASK ROUTES
-# ─────────────────────────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
@@ -546,7 +510,7 @@ def status():
         "audio_ok":         audio_ok,
         "audio_available":  AUDIO_AVAILABLE,
         "audio_level":      audio.get("level", "NONE"),
-        "speaker":          speaker_status,   # {enrolled, embed_path, threshold}
+        "speaker":          speaker_status,   
     })
 
 
@@ -642,9 +606,6 @@ def voice_results():
         return jsonify(dict(latest_audio_result))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FACE ENROLLMENT & VERIFICATION ROUTES
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _get_face_model():
     """Lazy-load InsightFace model (CPU)."""
@@ -889,9 +850,6 @@ def face_status_route():
     })
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     load_model()
     start_audio_pipeline()
