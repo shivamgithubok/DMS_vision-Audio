@@ -1644,6 +1644,12 @@
           <span class="voice-val" id="voice-keyword">—</span>
         </div>
 
+        <!-- Speaker ID -->
+        <div class="voice-row">
+          <span class="voice-label">🆔 Speaker</span>
+          <span class="voice-val" id="voice-speaker">—</span>
+        </div>
+
         <!-- BERT -->
         <div class="voice-row">
           <span class="voice-label">🧠 Sentiment</span>
@@ -2114,6 +2120,21 @@
         kwEl.style.color = "var(--accent2)";
       }
 
+      // Speaker ID
+      const spkEl = document.getElementById("voice-speaker");
+      const spkId = data.speaker || "—";
+      const spkScore = (data.speaker_score || 0).toFixed(2);
+      if (spkId && spkId !== "—" && spkId !== "UNKNOWN") {
+        spkEl.textContent = `${spkId} (${spkScore})`;
+        spkEl.style.color = spkId === "DRIVER" ? "var(--accent)" : "var(--warn)";
+      } else if (spkId === "UNKNOWN") {
+        spkEl.textContent = `UNKNOWN (${spkScore})`;
+        spkEl.style.color = "var(--text-dim)";
+      } else {
+        spkEl.textContent = "—";
+        spkEl.style.color = "var(--text-dim)";
+      }
+
       // BERT
       const bLabel = data.bert_label || "NEUTRAL";
       const bScore = (data.bert_score || 0).toFixed(2);
@@ -2305,7 +2326,7 @@
         const r = await fetch("/status");
         const data = await r.json();
         if (data.speaker && data.speaker.enrolled) {
-          updateSpeakerBadge(true, enrolState_driverName || "DRIVER");
+          updateSpeakerBadge(true, data.speaker?.driver_name || "DRIVER");
         }
       } catch (e) { /* ignore */ }
     }
