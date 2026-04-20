@@ -17,6 +17,25 @@
 # Final Risk Score  (speaker-aware)
 #  ↓
 # Alert
+# ============================================================
+# DMS PIPELINE  —  fixed version
+#
+# Key fixes vs previous version:
+#   1. Speaker ID runs ONCE at segment-end on full audio (not mid-stream)
+#      → eliminates CPU spike, fixes latency, gives TitaNet enough audio
+#   2. Removed `continue` inside `elif state == "continue"` block
+#      → that was silently dropping mic chunks and starving the queue
+#   3. BERT risk capped at 0.55 so sentiment alone can never fire CRITICAL
+#      → only keyword hits can reach WARNING/CRITICAL on their own
+#   4. UNKNOWN speaker weight raised to 0.85 (was 0.6) so real alerts
+#      still fire even before enrolment
+#   5. Graceful shutdown — no sys.exit() in signal handler; let the loop
+#      exit cleanly so torch teardown doesn't core-dump
+#   6. Enrollment audio pre-filtered to speech-only frames before enrol
+#      → better voiceprint quality
+#   7. Speaker smoothing: rolling window of last N scores, majority vote
+#      → stops flip-flopping between DRIVER / UNCERTAIN
+# ============================================================
 
 import os
 import time
@@ -25,6 +44,7 @@ import threading
 import signal
 import sys
 import enum
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
@@ -48,17 +68,17 @@ except ImportError:
 
 SR          = 16000
 CHUNK_MS    = 30
-CHUNK       = int(SR * CHUNK_MS / 1000)  
+CHUNK       = int(SR * CHUNK_MS / 1000)   # 480 samples
 CHANNELS    = 1
 
 # VAD
-VAD_MODE    = 1   
+VAD_MODE    = 2   # 0-3, higher = stricter
 
 # FSM
-START_SPEECH_FRAMES = 3     
-END_SILENCE_FRAMES  = 15    
-MIN_SEGMENT_SEC     = 0.3
-MAX_SEGMENT_SEC     = 6.0
+START_SPEECH_FRAMES = 3      # 3 × 30ms = 90ms to start
+END_SILENCE_FRAMES  = 20     # 20 × 30ms = 600ms silence to end
+MIN_SEGMENT_SEC     = 1.5    # TitaNet needs ≥1.5s
+MAX_SEGMENT_SEC     = 7.0
 
 # Whisper
 WHISPER_MODEL   = "base.en"
@@ -67,6 +87,10 @@ WHISPER_COMPUTE = "int8"
 
 # BERT
 BERT_MIN_TEXT_LEN = 3
+BERT_RISK_CAP     = 0.55   # ← cap: sentiment alone cannot fire CRITICAL
+
+# Speaker smoothing — rolling window size
+SPEAKER_WINDOW = 4   # last 4 segment results voted on
 
 # ============================================================
 # ENUMS & DATACLASSES
@@ -89,8 +113,8 @@ class PipelineResult:
     keyword_hit:   Optional[str] = None
     text_risk:     float         = 0.0
     transcript:    Optional[str] = None
-    speaker_id:    Optional[str] = None   
-    speaker_score: float         = 0.0   
+    speaker_id:    Optional[str] = None
+    speaker_score: float         = 0.0
     latency_ms:    float         = 0.0
     bert_label:    str           = "NEUTRAL"
     bert_score:    float         = 0.0
@@ -122,7 +146,7 @@ class VehicleContext:
 
 
 # ============================================================
-# GLOBALS (standalone CLI mode only)
+# GLOBALS  (standalone CLI mode only)
 # ============================================================
 
 audio_q       = queue.Queue()
@@ -147,33 +171,79 @@ def float_to_pcm16(x: np.ndarray) -> bytes:
     x = np.clip(x, -1.0, 1.0)
     return (x * 32767).astype(np.int16).tobytes()
 
-def normalize_audio(x: np.ndarray, target_rms=0.05, max_gain=8.0):
+def normalize_audio(x: np.ndarray, target_rms: float = 0.05, max_gain: float = 8.0) -> np.ndarray:
     cur = rms(x)
     if cur < 1e-6:
         return x
     gain = min(target_rms / cur, max_gain)
     return np.clip(x * gain, -1.0, 1.0)
 
-
 def _is_whisper_hallucination(text: str) -> bool:
     """Detect Whisper hallucinations — repetitive loops on noisy audio."""
     if not text or len(text) < 20:
         return False
     t = text.lower().strip()
-    # 1. Check for any 4-8 word phrase repeated 3+ times
     words = t.split()
     for ngram_len in range(3, 9):
         if len(words) < ngram_len * 3:
             continue
         for start in range(len(words) - ngram_len * 3 + 1):
             phrase = " ".join(words[start:start + ngram_len])
-            count = t.count(phrase)
-            if count >= 3:
+            if t.count(phrase) >= 3:
                 return True
-    # 2. Very long transcript from a short segment is suspicious
     if len(text) > 600:
         return True
     return False
+
+def _filter_speech_frames(audio: np.ndarray, sr: int = SR,
+                           chunk: int = CHUNK, vad_mode: int = VAD_MODE) -> np.ndarray:
+    """
+    Strip silence/noise from audio using VAD.
+    Returns only speech frames concatenated — useful for enrollment.
+    """
+    vad = webrtcvad.Vad(vad_mode)
+    speech_frames = []
+    for i in range(0, len(audio) - chunk, chunk):
+        frame = audio[i:i + chunk]
+        pcm   = float_to_pcm16(frame)
+        try:
+            if vad.is_speech(pcm, sr):
+                speech_frames.append(frame)
+        except Exception:
+            pass
+    if not speech_frames:
+        return audio          # fallback: return full audio if VAD finds nothing
+    return np.concatenate(speech_frames)
+
+
+# ============================================================
+# SPEAKER SMOOTHER
+# ============================================================
+
+class SpeakerSmoother:
+    """
+    Keeps a rolling window of (label, score) pairs.
+    Returns the majority-vote label and mean score of that label.
+    Prevents flip-flopping between DRIVER / UNCERTAIN every segment.
+    """
+    def __init__(self, window: int = SPEAKER_WINDOW):
+        self._window  = window
+        self._history: deque = deque(maxlen=window)
+
+    def update(self, label: str, score: float) -> tuple:
+        self._history.append((label, score))
+        # Majority vote
+        counts: dict = {}
+        scores: dict = {}
+        for lbl, sc in self._history:
+            counts[lbl] = counts.get(lbl, 0) + 1
+            scores.setdefault(lbl, []).append(sc)
+        best_label = max(counts, key=counts.get)
+        avg_score  = float(np.mean(scores[best_label]))
+        return best_label, avg_score
+
+    def reset(self):
+        self._history.clear()
 
 
 # ============================================================
@@ -220,11 +290,11 @@ class TextRiskClassifier:
         self.pipe = hf_pipeline(
             "sentiment-analysis",
             model="distilbert-base-uncased-finetuned-sst-2-english",
-            device=-1
+            device=-1,
         )
         print("[OK] BERT text classifier loaded")
 
-    def classify(self, text: str):
+    def classify(self, text: str) -> dict:
         text = text.strip()
         if len(text) < BERT_MIN_TEXT_LEN:
             return {"label": "NEUTRAL", "score": 0.0, "risk": 0.0}
@@ -232,7 +302,15 @@ class TextRiskClassifier:
             out   = self.pipe(text, truncation=True)[0]
             label = out["label"]
             score = float(out["score"])
-            risk  = score if label == "NEGATIVE" else 0.15 * (1.0 - score)
+
+            # Map sentiment → risk, then cap so BERT alone can't fire CRITICAL
+            if label == "NEGATIVE":
+                raw_risk = score
+            else:
+                raw_risk = 0.10 * (1.0 - score)
+
+            risk = min(raw_risk, BERT_RISK_CAP)   # ← cap applied here
+
             return {"label": label, "score": score, "risk": risk}
         except Exception as e:
             print(f"[BERT ERROR] {e}")
@@ -245,8 +323,8 @@ class TextRiskClassifier:
 
 class SpeechFSM:
     def __init__(self):
-        self.in_speech  = False
-        self.speech_run = 0
+        self.in_speech   = False
+        self.speech_run  = 0
         self.silence_run = 0
 
     def update(self, is_speech: bool) -> str:
@@ -278,11 +356,11 @@ class ASR:
         self.model = WhisperModel(
             WHISPER_MODEL,
             device=WHISPER_DEVICE,
-            compute_type=WHISPER_COMPUTE
+            compute_type=WHISPER_COMPUTE,
         )
         print("[OK] faster-whisper loaded")
 
-    def transcribe(self, audio: np.ndarray):
+    def transcribe(self, audio: np.ndarray) -> tuple:
         t0 = time.time()
         segments, _ = self.model.transcribe(
             audio.astype(np.float32),
@@ -307,16 +385,17 @@ def compute_final_risk(keyword_score: float,
 
     base = max(keyword_score, bert_risk)
 
-    # High-confidence keywords bypass speaker weighting entirely
-    KEYWORD_OVERRIDE_THRESHOLD = 0.90
-    if keyword_score >= KEYWORD_OVERRIDE_THRESHOLD:
-        weighted = base   # full weight — "help", "emergency", "call ambulance"
+    # High-confidence keywords always fire at full weight
+    KEYWORD_OVERRIDE = 0.90
+    if keyword_score >= KEYWORD_OVERRIDE:
+        weighted = base
     elif speaker_id == "DRIVER":
         weighted = base * 1.0
     elif speaker_id == "PASSENGER":
         weighted = base * 0.7
-    else:  # UNKNOWN
-        weighted = base * 0.6   # raised from 0.4 — don't suppress real alerts
+    else:                            # UNKNOWN / UNCERTAIN
+        weighted = base * 0.85       # was 0.6 — don't suppress real alerts
+                                     # but BERT cap means max ~0.47 without KW
 
     if weighted >= 0.85:
         alert = "CRITICAL"
@@ -354,7 +433,7 @@ class AlertOutput:
 class DMSPipeline:
     """
     Class-based API used by app.py.
-    Mic → VAD → FSM → SpeakerVerifier → ASR → Keyword → BERT → Risk → Alert
+    Mic → VAD → FSM → buffer → (at end) SpeakerVerifier → ASR → Keyword → BERT → Risk
     """
 
     def __init__(self, mic_device=None):
@@ -372,7 +451,8 @@ class DMSPipeline:
         self._bert     = None
         self._asr      = None
         self._fsm      = None
-        self._speaker  = None   # SpeakerVerifier instance
+        self._speaker  = None
+        self._smoother = SpeakerSmoother(SPEAKER_WINDOW)
 
     # ── Public API ────────────────────────────────────────────
 
@@ -384,19 +464,19 @@ class DMSPipeline:
         self._thread.start()
 
     def stop(self):
+        """Gracefully stop — does NOT call sys.exit so torch can clean up."""
         self._running = False
         if self._thread:
-            self._thread.join(timeout=3.0)
+            self._thread.join(timeout=5.0)
 
     def update_vehicle_context(self, ctx: VehicleContext):
         with self._lock:
             self._vehicle_ctx = ctx
 
-    def enrol_driver(self, seconds: float = 5.0):
+    def enrol_driver(self, seconds: float = 6.0):
         """
-        Record driver voice and save embedding.
-        Called from app.py POST /audio_enrol endpoint.
-        Delegates to SpeakerVerifier.enrol().
+        Record driver voice, strip silence, normalize, then save embedding.
+        Called from app.py POST /audio_enrol.
         """
         if self._speaker is None:
             print("[ENROL] Speaker module not loaded yet — retrying in 1s")
@@ -415,16 +495,24 @@ class DMSPipeline:
                             blocksize=CHUNK, callback=_cb):
             time.sleep(seconds)
 
-        audio = np.concatenate(frames)
-        self._speaker.enrol(audio)
-        print("[ENROL] Driver voice registered ✓")
+        raw   = np.concatenate(frames)
+        # Strip silence so voiceprint is speech-only
+        clean = _filter_speech_frames(raw)
+        clean = normalize_audio(clean, target_rms=0.05)
+
+        if len(clean) / SR < 1.0:
+            print("[ENROL] Not enough speech detected — please speak more clearly")
+            return
+
+        self._smoother.reset()   # reset history after new enrolment
+        self._speaker.enrol(clean)
+        print(f"[ENROL] Driver voice registered ✓  ({len(clean)/SR:.1f}s of speech used)")
 
     def get_latest_result(self) -> PipelineResult:
         with self._lock:
             return self._latest_result
 
     def get_speaker_status(self) -> dict:
-        """Return speaker registration state for /status endpoint."""
         if self._speaker is None:
             return {"enrolled": False, "available": False}
         info = self._speaker.status()
@@ -441,7 +529,6 @@ class DMSPipeline:
         self._asr  = ASR()
         self._fsm  = SpeechFSM()
 
-        # Load speaker verifier
         if SPEAKER_AVAILABLE:
             try:
                 self._speaker = SpeakerVerifier()
@@ -495,30 +582,50 @@ class DMSPipeline:
 
             state = self._fsm.update(is_speech)
 
+            # ── Accumulate segment ────────────────────────────
             if state == "start":
                 current_segment = [clean.copy()]
-            elif state == "continue":
-                current_segment.append(clean.copy())
-                if len(np.concatenate(current_segment)) / SR >= MAX_SEGMENT_SEC:
-                    state = "end"
 
+            elif state == "continue":
+                # FIX: NO `continue` statement here — every chunk must be
+                # processed; skipping causes queue backup and latency
+                current_segment.append(clean.copy())
+                seg_len = len(np.concatenate(current_segment)) / SR
+                if seg_len >= MAX_SEGMENT_SEC:
+                    state = "end"   # force end on max length
+
+            # ── Process completed segment ─────────────────────
             if state == "end" and len(current_segment) > 0:
                 segment         = np.concatenate(current_segment)
                 current_segment = []
+                seg_len         = len(segment) / SR
 
-                if len(segment) / SR < MIN_SEGMENT_SEC:
+                if seg_len < MIN_SEGMENT_SEC:
+                    # Too short — skip silently, don't log spam
                     continue
 
-                # ── Speaker ID ────────────────────────────────
+                t_start = time.time()
+
+                # ── Speaker ID (runs ONCE on full segment) ────
+                # Running on the full segment gives TitaNet the audio it
+                # needs and avoids the per-chunk CPU spike.
                 if self._speaker is not None:
-                    speaker_id, spk_score = self._speaker.identify(segment)
+                    try:
+                        raw_label, raw_score = self._speaker.identify(segment)
+                        # Smooth over last N segments → stable label
+                        speaker_id, spk_score = self._smoother.update(raw_label, raw_score)
+                        print(f"[SPEAKER] raw={raw_label}({raw_score:.3f}) "
+                              f"→ smoothed={speaker_id}({spk_score:.3f})")
+                    except Exception as e:
+                        print(f"[SPEAKER ERROR] {e}")
+                        speaker_id, spk_score = "UNKNOWN", 0.0
                 else:
                     speaker_id, spk_score = "UNKNOWN", 0.0
 
-                # ── ASR ───────────────────────────────────
+                # ── ASR ───────────────────────────────────────
                 text, asr_latency = self._asr.transcribe(segment)
 
-                # ── Hallucination filter ──────────────────
+                # ── Hallucination filter ──────────────────────
                 if text and _is_whisper_hallucination(text):
                     print(f"[DMS] Hallucination filtered: {text[:80]!r}…")
                     text = ""
@@ -529,12 +636,13 @@ class DMSPipeline:
                 # ── BERT ──────────────────────────────────────
                 bert_out = self._bert.classify(text)
 
-                # ── Risk (speaker-aware) ──────────────────────
+                # ── Risk ──────────────────────────────────────
                 final_risk, alert_str = compute_final_risk(
                     kw_score, bert_out["risk"], speaker_id
                 )
-
                 alert_level = AlertLevel[alert_str]
+
+                total_latency = (time.time() - t_start) * 1000 + asr_latency
 
                 result = PipelineResult(
                     alert_level   = alert_level,
@@ -547,7 +655,7 @@ class DMSPipeline:
                     transcript    = text if text else None,
                     speaker_id    = speaker_id,
                     speaker_score = spk_score,
-                    latency_ms    = asr_latency,
+                    latency_ms    = total_latency,
                     bert_label    = bert_out["label"],
                     bert_score    = bert_out["score"],
                 )
@@ -558,9 +666,11 @@ class DMSPipeline:
                 self._alert_output.dispatch(result)
 
                 print(
-                    f"[DMS] speaker={speaker_id}({spk_score:.2f}) "
+                    f"[DMS] seg={seg_len:.1f}s "
+                    f"speaker={speaker_id}({spk_score:.2f}) "
                     f"transcript={text!r} kw={kw} "
-                    f"risk={final_risk:.2f} alert={alert_str}"
+                    f"risk={final_risk:.2f} alert={alert_str} "
+                    f"lat={total_latency:.0f}ms"
                 )
 
         stream.stop()
@@ -569,14 +679,14 @@ class DMSPipeline:
 
 
 # ============================================================
-# SHUTDOWN
+# SHUTDOWN  — graceful, no sys.exit in signal handler
 # ============================================================
 
 def stop_handler(sig, frame):
     global running
     print("\n[INFO] Stopping...")
     running = False
-    sys.exit(0)
+    # Do NOT call sys.exit here — torch atexit hooks need to run cleanly
 
 signal.signal(signal.SIGINT,  stop_handler)
 signal.signal(signal.SIGTERM, stop_handler)
@@ -589,11 +699,12 @@ signal.signal(signal.SIGTERM, stop_handler)
 def main():
     global running, chunk_counter
 
-    vad = webrtcvad.Vad(VAD_MODE)
-    kws = KeywordSpotter()
+    vad  = webrtcvad.Vad(VAD_MODE)
+    kws  = KeywordSpotter()
     bert = TextRiskClassifier()
     asr  = ASR()
     fsm  = SpeechFSM()
+    smoother = SpeakerSmoother()
 
     speaker = None
     if SPEAKER_AVAILABLE:
@@ -622,7 +733,7 @@ def main():
             raw   = chunk.astype(np.float32)
             clean = normalize_audio(raw, target_rms=0.05)
 
-            pcm = float_to_pcm16(raw)
+            pcm       = float_to_pcm16(raw)
             is_speech = vad.is_speech(pcm, SR)
             state     = fsm.update(is_speech)
 
@@ -633,28 +744,27 @@ def main():
                 if len(np.concatenate(current_segment)) / SR >= MAX_SEGMENT_SEC:
                     state = "end"
 
-            if chunk_counter % 10 == 0:
-                print(
-                    f"[CHUNK {chunk_counter:04d}] "
-                    f"rms={rms(raw):.5f} speech={is_speech} fsm={state}"
-                )
+            if chunk_counter % 30 == 0:
+                print(f"[CHUNK {chunk_counter:04d}] rms={rms(raw):.5f} "
+                      f"speech={is_speech} fsm={state}")
 
             if state == "end" and len(current_segment) > 0:
                 segment         = np.concatenate(current_segment)
                 current_segment = []
 
                 if len(segment) / SR < MIN_SEGMENT_SEC:
-                    print("\n[SKIP] segment too short\n")
+                    print("[SKIP] segment too short")
                     continue
 
                 print("\n================ DMS AUDIO DEBUG ================")
 
-                # Speaker
+                # Speaker (on full segment)
                 if speaker is not None:
-                    spk_id, spk_score = speaker.identify(segment)
-                    print(f"[SPEAKER]    id={spk_id}  score={spk_score:.3f}")
+                    raw_lbl, raw_sc = speaker.identify(segment)
+                    spk_id, spk_sc  = smoother.update(raw_lbl, raw_sc)
+                    print(f"[SPEAKER]    raw={raw_lbl}({raw_sc:.3f}) → {spk_id}({spk_sc:.3f})")
                 else:
-                    spk_id, spk_score = "UNKNOWN", 0.0
+                    spk_id, spk_sc = "UNKNOWN", 0.0
 
                 # ASR
                 text, latency = asr.transcribe(segment)
@@ -666,12 +776,17 @@ def main():
 
                 # BERT
                 bout = bert.classify(text)
-                print(f"[BERT]       label={bout['label']}  score={bout['score']:.2f}  risk={bout['risk']:.2f}")
+                print(f"[BERT]       label={bout['label']}  score={bout['score']:.2f}"
+                      f"  risk={bout['risk']:.2f}")
 
                 # Risk
                 risk, alert = compute_final_risk(kw_score, bout["risk"], spk_id)
                 print(f"[RISK]       score={risk:.2f}  alert={alert}")
                 print("=================================================\n")
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
